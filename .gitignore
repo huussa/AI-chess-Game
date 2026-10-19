@@ -1,6 +1,5 @@
 # Learned Q-learning data is generated locally and can grow large.
-chess_q_table
-chess_q_table.tmp
+chess_q_table*
 
 # Python cache files
 __pycache__/

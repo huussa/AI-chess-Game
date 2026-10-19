@@ -1,85 +1,325 @@
-"""Tabular Q-learning support for the Pygame chess project.
+"""Disk-backed tabular Q-learning for the chess game.
 
-The implementation deliberately keeps a separate table for each AI colour.
-It is a small, transparent baseline rather than a high-performance chess
-engine: full chess has a huge state space, so quality improves gradually as
-more episodes are added.
+The Q-table is stored in SQLite rather than one giant JSON dictionary. During
+a game, only values for the current board state are queried, keeping RAM
+usage stable after lengthy training runs.
 """
 from __future__ import annotations
 
-import json
 import random
+import sqlite3
+import json
 from pathlib import Path
 from typing import Callable, Optional
 
-from chess_engine import BLACK, WHITE, Board, Move, opponent
+from chess_engine import BLACK, WHITE, Board, Move
 
-# JSON content, kept under the exact user-facing model filename.
 TABLE_PATH = Path(__file__).with_name("chess_q_table")
+LEGACY_PATH = Path(__file__).with_name("chess_q_table.legacy.json")
+MAX_STATES_PER_COLOR = 75_000
 PIECE_VALUE = {"P": 1.0, "N": 3.0, "B": 3.0, "R": 5.0, "Q": 9.0, "K": 0.0}
-
-
-def empty_tables() -> dict:
-    return {
-        "format": "chess-q-learning-v1",
-        "white": {},
-        "black": {},
-        "stats": {"white_episodes": 0, "black_episodes": 0},
-    }
-
-
-def load_tables(path: Path = TABLE_PATH) -> dict:
-    if not path.exists():
-        return empty_tables()
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            tables = json.load(file)
-        if tables.get("format") != "chess-q-learning-v1":
-            return empty_tables()
-        tables.setdefault("white", {})
-        tables.setdefault("black", {})
-        tables.setdefault("stats", {"white_episodes": 0, "black_episodes": 0})
-        return tables
-    except (OSError, json.JSONDecodeError):
-        # A damaged or partial file must not prevent the game from launching.
-        return empty_tables()
-
-
-def save_tables(tables: dict, path: Path = TABLE_PATH) -> None:
-    """Atomically persist the learned values so an interrupted save is safe."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(tables, file, ensure_ascii=False, separators=(",", ":"))
-    temporary.replace(path)
-
-
-def state_id(board: Board) -> str:
-    """Compact, JSON-safe state key containing all move-relevant position data."""
-    squares = "".join(piece or "--" for row in board.grid for piece in row)
-    rights = "".join(key for key in sorted(board.castling) if board.castling[key]) or "-"
-    ep = "-" if board.en_passant is None else f"{board.en_passant[0]}{board.en_passant[1]}"
-    return f"{squares}|{board.turn}|{rights}|{ep}"
 
 
 def _table_name(color: str) -> str:
     return "white" if color == WHITE else "black"
 
 
-def choose_move(board: Board, color: str, table: dict, epsilon: float, rng: random.Random) -> Move:
+def state_id(board: Board) -> str:
+    squares = "".join(piece or "--" for row in board.grid for piece in row)
+    rights = "".join(key for key in sorted(board.castling) if board.castling[key]) or "-"
+    ep = "-" if board.en_passant is None else f"{board.en_passant[0]}{board.en_passant[1]}"
+    return f"{squares}|{board.turn}|{rights}|{ep}"
+
+
+class QTableStore:
+    """A bounded, on-disk Q-table with independent White and Black data."""
+
+    def __init__(self, path: Path = TABLE_PATH) -> None:
+        self.path = path
+        self._preserve_legacy_json()
+        self.connection = sqlite3.connect(self.path, timeout=30)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self._create_schema()
+
+    def _preserve_legacy_json(self) -> None:
+        """Move the old JSON model aside without loading it into RAM."""
+        if not self.path.exists():
+            return
+        with self.path.open("rb") as file:
+            is_sqlite = file.read(16) == b"SQLite format 3\x00"
+        if is_sqlite:
+            return
+        legacy = self.path.with_name(self.path.name + ".legacy.json")
+        if legacy.exists():
+            # Keep both existing files safe; use a sidecar database instead.
+            self.path = self.path.with_name(self.path.name + ".sqlite")
+            return
+        self.path.replace(legacy)
+
+    def _create_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS states (
+                color TEXT NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (color, state)
+            );
+            CREATE TABLE IF NOT EXISTS q_values (
+                color TEXT NOT NULL,
+                state TEXT NOT NULL,
+                action TEXT NOT NULL,
+                value REAL NOT NULL,
+                visits INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (color, state, action)
+            );
+            CREATE INDEX IF NOT EXISTS q_values_state_idx ON q_values(color, state);
+            """
+        )
+        for key in ("white_episodes", "black_episodes", "white_states", "black_states"):
+            self.connection.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, 0)", (key,))
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.commit()
+        self.connection.close()
+
+    def reset(self) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM q_values")
+            self.connection.execute("DELETE FROM states")
+            for key in ("white_episodes", "black_episodes", "white_states", "black_states"):
+                self.connection.execute("UPDATE metadata SET value = 0 WHERE key = ?", (key,))
+
+    def _meta(self, key: str) -> int:
+        return int(self.connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()[0])
+
+    def _set_meta(self, key: str, value: int) -> None:
+        self.connection.execute("UPDATE metadata SET value = ? WHERE key = ?", (value, key))
+
+    def values_for(self, color: str, state: str) -> dict[str, float]:
+        rows = self.connection.execute(
+            "SELECT action, value FROM q_values WHERE color = ? AND state = ?", (_table_name(color), state)
+        )
+        return {action: value for action, value in rows}
+
+    def _admit_state(self, color: str, state: str) -> bool:
+        name = _table_name(color)
+        found = self.connection.execute(
+            "SELECT 1 FROM states WHERE color = ? AND state = ?", (name, state)
+        ).fetchone()
+        if found:
+            return True
+        count_key = name + "_states"
+        count = self._meta(count_key)
+        if count >= MAX_STATES_PER_COLOR:
+            return False
+        self.connection.execute("INSERT INTO states(color, state) VALUES (?, ?)", (name, state))
+        self._set_meta(count_key, count + 1)
+        return True
+
+    def update(self, color: str, state: str, action: str, value: float) -> None:
+        if not self._admit_state(color, state):
+            return
+        name = _table_name(color)
+        self.connection.execute(
+            """
+            INSERT INTO q_values(color, state, action, value, visits)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(color, state, action) DO UPDATE SET
+                value = excluded.value,
+                visits = q_values.visits + 1
+            """,
+            (name, state, action, value),
+        )
+
+    def increment_episodes(self, color: str) -> None:
+        key = _table_name(color) + "_episodes"
+        self.connection.execute("UPDATE metadata SET value = value + 1 WHERE key = ?", (key,))
+
+    def stats(self) -> dict[str, int]:
+        keys = ("white_episodes", "black_episodes", "white_states", "black_states")
+        return {key: self._meta(key) for key in keys}
+
+
+class _StreamingJson:
+    """Small JSON reader that never retains a complete large JSON object."""
+
+    def __init__(self, path: Path) -> None:
+        self.file = path.open("r", encoding="utf-8")
+        self.buffer = ""
+        self.position = 0
+        self.decoder = json.JSONDecoder()
+        self.finished = False
+
+    def close(self) -> None:
+        self.file.close()
+
+    def _compact(self) -> None:
+        if self.position > 65_536:
+            self.buffer = self.buffer[self.position:]
+            self.position = 0
+
+    def _fill(self) -> bool:
+        self._compact()
+        chunk = self.file.read(65_536)
+        if not chunk:
+            self.finished = True
+            return False
+        self.buffer += chunk
+        return True
+
+    def _skip_space(self) -> None:
+        while True:
+            while self.position < len(self.buffer) and self.buffer[self.position].isspace():
+                self.position += 1
+            if self.position < len(self.buffer) or not self._fill():
+                return
+
+    def peek(self) -> str:
+        self._skip_space()
+        if self.position >= len(self.buffer):
+            raise ValueError("Unexpected end of legacy Q-table")
+        return self.buffer[self.position]
+
+    def expect(self, character: str) -> None:
+        if self.peek() != character:
+            raise ValueError(f"Expected {character!r} in legacy Q-table")
+        self.position += 1
+
+    def value(self):
+        self._skip_space()
+        while True:
+            try:
+                decoded, end = self.decoder.raw_decode(self.buffer, self.position)
+                self.position = end
+                self._compact()
+                return decoded
+            except json.JSONDecodeError:
+                if not self._fill():
+                    raise ValueError("Invalid or incomplete legacy Q-table")
+
+
+def _read_legacy_table(stream: _StreamingJson, color: str, write_row, progress) -> int:
+    stream.expect("{")
+    states = 0
+    while stream.peek() != "}":
+        state = stream.value()
+        if not isinstance(state, str):
+            raise ValueError("Legacy Q-table has an invalid state key")
+        stream.expect(":")
+        actions = stream.value()
+        if not isinstance(actions, dict):
+            raise ValueError("Legacy Q-table has invalid action data")
+        write_row(color, state, actions)
+        states += 1
+        if progress and states % 10_000 == 0:
+            progress(_table_name(color), states)
+        separator = stream.peek()
+        if separator == ",":
+            stream.expect(",")
+        elif separator != "}":
+            raise ValueError("Legacy Q-table has an invalid table separator")
+    stream.expect("}")
+    return states
+
+
+def import_legacy_json(
+    legacy_path: Path = LEGACY_PATH,
+    path: Path = TABLE_PATH,
+    progress: Optional[Callable[[str, int], None]] = None,
+) -> dict[str, int]:
+    """Copy an old JSON model into SQLite without loading it all into RAM.
+
+    The source file is deliberately left untouched. The destination database is
+    reset first because this is a complete model import, not incremental train.
+    """
+    if not legacy_path.exists():
+        raise FileNotFoundError(f"Legacy model not found: {legacy_path.name}")
+    store = QTableStore(path)
+    stream = _StreamingJson(legacy_path)
+    pending_values = []
+    pending_states = []
+    imported = {"white": 0, "black": 0}
+    legacy_stats = {}
+
+    def flush() -> None:
+        if not pending_values:
+            return
+        store.connection.executemany(
+            "INSERT OR IGNORE INTO states(color, state) VALUES (?, ?)", pending_states
+        )
+        store.connection.executemany(
+            """
+            INSERT INTO q_values(color, state, action, value, visits)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(color, state, action) DO UPDATE SET value = excluded.value
+            """,
+            pending_values,
+        )
+        store.connection.commit()
+        pending_values.clear()
+        pending_states.clear()
+
+    def write_row(color: str, state: str, actions: dict) -> None:
+        name = _table_name(color)
+        imported[name] += 1
+        pending_states.append((name, state))
+        for action, value in actions.items():
+            pending_values.append((name, state, action, float(value)))
+        if len(pending_values) >= 5_000:
+            flush()
+
+    try:
+        store.reset()
+        stream.expect("{")
+        while stream.peek() != "}":
+            key = stream.value()
+            stream.expect(":")
+            if key == "white":
+                _read_legacy_table(stream, WHITE, write_row, progress)
+            elif key == "black":
+                _read_legacy_table(stream, BLACK, write_row, progress)
+            else:
+                value = stream.value()
+                if key == "stats" and isinstance(value, dict):
+                    legacy_stats = value
+            separator = stream.peek()
+            if separator == ",":
+                stream.expect(",")
+            elif separator != "}":
+                raise ValueError("Legacy Q-table has an invalid top-level separator")
+        stream.expect("}")
+        flush()
+        with store.connection:
+            store._set_meta("white_states", imported["white"])
+            store._set_meta("black_states", imported["black"])
+            store._set_meta("white_episodes", int(legacy_stats.get("white_episodes", 0)))
+            store._set_meta("black_episodes", int(legacy_stats.get("black_episodes", 0)))
+        return store.stats()
+    finally:
+        stream.close()
+        store.close()
+
+
+def choose_move(board: Board, color: str, store: QTableStore, epsilon: float, rng: random.Random) -> Move:
     legal = board.legal_moves()
     if not legal:
         raise ValueError("No legal move available")
     if rng.random() < epsilon:
         return rng.choice(legal)
-    values = table.get(state_id(board), {})
+    values = store.values_for(color, state_id(board))
     highest = max(values.get(move.uci(), 0.0) for move in legal)
     best = [move for move in legal if values.get(move.uci(), 0.0) == highest]
     return rng.choice(best)
 
 
-def best_move(board: Board, color: str, tables: dict, rng: Optional[random.Random] = None) -> Move:
-    """Choose the strongest learned legal move; falls back to a legal random move."""
-    return choose_move(board, color, tables[_table_name(color)], 0.0, rng or random.Random())
+def best_move(board: Board, color: str, store: QTableStore, rng: Optional[random.Random] = None) -> Move:
+    return choose_move(board, color, store, 0.0, rng or random.Random())
 
 
 def _reward_for_result(result: Optional[str], ai_color: str, captured: Optional[str]) -> float:
@@ -93,58 +333,49 @@ def _reward_for_result(result: Optional[str], ai_color: str, captured: Optional[
 
 
 def train_color(
-    tables: dict,
+    store: QTableStore,
     color: str,
     episodes: int,
     progress: Optional[Callable[[str, int, int], None]] = None,
     rng: Optional[random.Random] = None,
     max_plies: int = 80,
 ) -> None:
-    """Train one colour against a random legal-move opponent."""
     rng = rng or random.Random()
-    table = tables[_table_name(color)]
     alpha, gamma = 0.18, 0.92
     for episode in range(episodes):
         board = Board()
-        # Black's opponent makes the opening move before Black acts.
         if color == BLACK:
             board.push(rng.choice(board.legal_moves()))
         for _ in range(max_plies):
-            if board.turn != color:
-                legal = board.legal_moves()
-                if not legal:
-                    break
-                board.push(rng.choice(legal))
-            if board.outcome():
-                break
-
             state = state_id(board)
             epsilon = max(0.06, 0.35 * (1 - episode / max(episodes, 1)))
-            move = choose_move(board, color, table, epsilon, rng)
+            move = choose_move(board, color, store, epsilon, rng)
             captured = board.piece_at(move.end)
             board.push(move)
             result = board.outcome()
-
             if not result:
-                opponent_moves = board.legal_moves()
-                if opponent_moves:
-                    board.push(rng.choice(opponent_moves))
+                replies = board.legal_moves()
+                if replies:
+                    board.push(rng.choice(replies))
                 result = board.outcome()
 
             reward = _reward_for_result(result, color, captured)
             next_best = 0.0
             if not result and board.turn == color:
-                next_values = table.get(state_id(board), {})
+                next_values = store.values_for(color, state_id(board))
                 next_legal = board.legal_moves()
                 if next_legal:
                     next_best = max(next_values.get(next_move.uci(), 0.0) for next_move in next_legal)
-            old_value = table.setdefault(state, {}).get(move.uci(), 0.0)
-            table[state][move.uci()] = old_value + alpha * (reward + gamma * next_best - old_value)
+            old_value = store.values_for(color, state).get(move.uci(), 0.0)
+            store.update(color, state, move.uci(), old_value + alpha * (reward + gamma * next_best - old_value))
             if result:
                 break
-        tables["stats"][_table_name(color) + "_episodes"] += 1
-        if progress and ((episode + 1) % 25 == 0 or episode + 1 == episodes):
-            progress(_table_name(color), episode + 1, episodes)
+        store.increment_episodes(color)
+        if (episode + 1) % 25 == 0 or episode + 1 == episodes:
+            store.connection.commit()
+            if progress:
+                progress(_table_name(color), episode + 1, episodes)
+    store.connection.commit()
 
 
 def train_both_colours(
@@ -152,15 +383,16 @@ def train_both_colours(
     reset: bool = False,
     progress: Optional[Callable[[str, int, int], None]] = None,
     path: Path = TABLE_PATH,
-) -> dict:
-    """Train White for ``episodes`` and Black for ``episodes``, then save."""
+) -> dict[str, int]:
     if episodes <= 0:
         raise ValueError("Training episodes must be greater than zero")
-    tables = empty_tables() if reset else load_tables(path)
-    if reset:
-        save_tables(tables, path)  # Deliberately replaces the previous model.
-    rng = random.Random()
-    train_color(tables, WHITE, episodes, progress, rng)
-    train_color(tables, BLACK, episodes, progress, rng)
-    save_tables(tables, path)
-    return tables
+    store = QTableStore(path)
+    try:
+        if reset:
+            store.reset()
+        rng = random.Random()
+        train_color(store, WHITE, episodes, progress, rng)
+        train_color(store, BLACK, episodes, progress, rng)
+        return store.stats()
+    finally:
+        store.close()

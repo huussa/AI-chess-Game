@@ -3,7 +3,7 @@ import threading
 
 import pygame
 
-from chess_ai import best_move, load_tables, train_both_colours
+from chess_ai import QTableStore, best_move, train_both_colours
 from chess_engine import BLACK, WHITE, Board, Move, opponent
 
 WINDOW = 720
@@ -11,6 +11,17 @@ SQUARE = WINDOW // 8
 LIGHT, DARK = (240, 217, 181), (181, 136, 99)
 SELECTED, TARGET = (246, 246, 105), (106, 168, 79)
 PIECES = {"wK":"♔", "wQ":"♕", "wR":"♖", "wB":"♗", "wN":"♘", "wP":"♙", "bK":"♚", "bQ":"♛", "bR":"♜", "bB":"♝", "bN":"♞", "bP":"♟"}
+
+# Menus deliberately remain compact; the match gets its own, roomier layout.
+GAME_WIDTH, GAME_HEIGHT = 1000, 860
+GAME_BOARD_SIZE, GAME_SQUARE = 600, 75
+GAME_BOARD_LEFT, GAME_BOARD_TOP = 46, 142
+GAME_BOARD_RECT = pygame.Rect(GAME_BOARD_LEFT, GAME_BOARD_TOP, GAME_BOARD_SIZE, GAME_BOARD_SIZE)
+LAST_MOVE = (247, 217, 87)
+# The match screen uses the same plum, gold, and cream palette as the menus.
+GAME_BG, GAME_PANEL, GAME_PANEL_DARK = (36, 29, 47), (47, 39, 59), (39, 32, 50)
+GAME_BORDER, GAME_TEXT, GAME_MUTED = (211, 170, 112), (255, 242, 215), (211, 190, 171)
+PIECE_POINTS = {"Q": 9, "R": 5, "B": 3, "N": 3, "P": 1}
 
 MENU_BG_TOP, MENU_BG_BOTTOM = (36, 29, 47), (82, 54, 68)
 MENU_CARD, MENU_BORDER = (47, 39, 59), (211, 170, 112)
@@ -28,6 +39,169 @@ def view_to_board(square, view_color):
     """Convert a clicked display square back to logical board coordinates."""
     row, col = square
     return (row, col) if view_color == WHITE else (7 - row, 7 - col)
+
+
+def replay_board(moves, move_count):
+    """Return a read-only historical position without changing the live game."""
+    replay = Board()
+    for move in moves[:move_count]:
+        replay.push(move)
+    return replay
+
+
+def material_points(board, color):
+    """Return the standard material value of the pieces a side still has."""
+    return sum(
+        PIECE_POINTS.get(piece[1], 0)
+        for row in board.grid
+        for piece in row
+        if piece and piece[0] == color
+    )
+
+
+def game_button(screen, rect, label, font, mouse, *, disabled=False, danger=False):
+    hovered = rect.collidepoint(mouse) and not disabled
+    if disabled:
+        fill, edge, text_color = (61, 51, 68), (104, 85, 93), (156, 140, 145)
+    elif danger:
+        fill, edge, text_color = ((138, 88, 105) if hovered else (105, 70, 83)), GAME_BORDER, GAME_TEXT
+    else:
+        fill, edge, text_color = ((225, 170, 91) if hovered else (198, 143, 72)), GAME_BORDER, GAME_TEXT
+    pygame.draw.rect(screen, (20, 16, 29), rect.move(0, 4), border_radius=13)
+    pygame.draw.rect(screen, fill, rect, border_radius=13)
+    pygame.draw.rect(screen, edge, rect, width=2, border_radius=13)
+    image = font.render(label, True, text_color)
+    screen.blit(image, image.get_rect(center=rect.center))
+
+
+def player_panel(screen, rect, name, color, points, font, small):
+    pygame.draw.rect(screen, GAME_PANEL, rect, border_radius=17)
+    pygame.draw.rect(screen, GAME_BORDER, rect, width=2, border_radius=17)
+    avatar = pygame.Rect(rect.x + 16, rect.y + 13, 48, 48)
+    pygame.draw.circle(screen, (232, 218, 193) if color == WHITE else (76, 62, 79), avatar.center, 24)
+    pygame.draw.circle(screen, GAME_BORDER, avatar.center, 24, width=2)
+    accent = (91, 71, 81) if color == WHITE else (232, 218, 193)
+    pygame.draw.circle(screen, accent, (avatar.centerx, avatar.y + 19), 8)
+    pygame.draw.arc(screen, accent, (avatar.x + 10, avatar.y + 23, 28, 23), 180, 360, width=5)
+    screen.blit(font.render(name, True, GAME_TEXT), (rect.x + 78, rect.y + 13))
+    score = small.render(f"{points} POINTS", True, GAME_MUTED)
+    screen.blit(score, (rect.x + 80, rect.y + 42))
+
+
+def draw_game_board(screen, board, selected, legal, piece_font, small, view_color, last_move):
+    for view_row in range(8):
+        for view_col in range(8):
+            row, col = view_to_board((view_row, view_col), view_color)
+            rect = pygame.Rect(
+                GAME_BOARD_LEFT + view_col * GAME_SQUARE,
+                GAME_BOARD_TOP + view_row * GAME_SQUARE,
+                GAME_SQUARE,
+                GAME_SQUARE,
+            )
+            pygame.draw.rect(screen, LIGHT if (row + col) % 2 == 0 else DARK, rect)
+            if last_move and (row, col) in (last_move.start, last_move.end):
+                highlight = pygame.Surface((GAME_SQUARE, GAME_SQUARE), pygame.SRCALPHA)
+                highlight.fill((*LAST_MOVE, 145))
+                screen.blit(highlight, rect.topleft)
+            if selected == (row, col):
+                pygame.draw.rect(screen, (255, 244, 143), rect, width=5)
+            if any(move.end == (row, col) for move in legal):
+                pygame.draw.circle(screen, (53, 87, 62), rect.center, 12)
+            piece = board.grid[row][col]
+            if piece:
+                # A small shadow and high-contrast ink make the system chess glyphs
+                # substantially clearer than the previous flat rendering.
+                glyph = PIECES[piece]
+                shadow = piece_font.render(glyph, True, (30, 30, 36))
+                ink = (249, 247, 238) if piece[0] == WHITE else (37, 42, 49)
+                image = piece_font.render(glyph, True, ink)
+                center = rect.center
+                screen.blit(shadow, shadow.get_rect(center=(center[0] + 2, center[1] + 3)))
+                screen.blit(image, image.get_rect(center=center))
+
+    pygame.draw.rect(screen, GAME_BORDER, GAME_BOARD_RECT, width=3)
+    for index in range(8):
+        file_label = "abcdefgh"[index if view_color == WHITE else 7 - index]
+        rank_label = str(8 - index if view_color == WHITE else index + 1)
+        screen.blit(small.render(file_label, True, GAME_MUTED), (GAME_BOARD_LEFT + index * GAME_SQUARE + 5, GAME_BOARD_TOP + GAME_BOARD_SIZE - 21))
+        screen.blit(small.render(rank_label, True, GAME_MUTED), (GAME_BOARD_LEFT + 5, GAME_BOARD_TOP + index * GAME_SQUARE + 3))
+
+
+def promotion_rects():
+    left, top, size, gap = 253, 363, 105, 13
+    return {kind: pygame.Rect(left + index * (size + gap), top, size, size) for index, kind in enumerate("QRBN")}
+
+
+def draw_promotion_picker(screen, piece_font, title_font, small, color):
+    shade = pygame.Surface((GAME_WIDTH, GAME_HEIGHT), pygame.SRCALPHA)
+    shade.fill((8, 11, 16, 185))
+    screen.blit(shade, (0, 0))
+    panel = pygame.Rect(211, 283, 578, 253)
+    pygame.draw.rect(screen, GAME_PANEL, panel, border_radius=20)
+    pygame.draw.rect(screen, (230, 202, 116), panel, width=3, border_radius=20)
+    title = title_font.render("Choose a promotion", True, GAME_TEXT)
+    screen.blit(title, title.get_rect(center=(GAME_WIDTH // 2, 326)))
+    for kind, rect in promotion_rects().items():
+        pygame.draw.rect(screen, (232, 226, 208), rect, border_radius=12)
+        pygame.draw.rect(screen, GAME_BORDER, rect, width=2, border_radius=12)
+        image = piece_font.render(PIECES[color + kind], True, (38, 43, 50) if color == BLACK else (103, 108, 116))
+        screen.blit(image, image.get_rect(center=(rect.centerx, rect.centery - 8)))
+        label = {"Q": "QUEEN", "R": "ROOK", "B": "BISHOP", "N": "KNIGHT"}[kind]
+        caption = small.render(label, True, (44, 50, 61))
+        screen.blit(caption, caption.get_rect(center=(rect.centerx, rect.bottom + 20)))
+    return promotion_rects()
+
+
+def draw_game_screen(screen, board, selected, legal, fonts, view_color, last_move, status, names, shown_moves, total_moves, resigned, promotion_choices):
+    title_font, small, button_font, piece_font = fonts
+    screen.fill(GAME_BG)
+    # Subtle board-like texture behind the panels.
+    for y in range(0, GAME_HEIGHT, 40):
+        for x in range(0, GAME_WIDTH, 40):
+            if (x // 40 + y // 40) % 2 == 0:
+                pygame.draw.rect(screen, (43, 35, 55), (x, y, 40, 40))
+
+    top_name, top_color = names["top"]
+    bottom_name, bottom_color = names["bottom"]
+    player_panel(
+        screen, pygame.Rect(46, 42, 600, 76), top_name, top_color,
+        material_points(board, top_color), button_font, small,
+    )
+    exit_rect = pygame.Rect(795, 47, 155, 54)
+    mouse = pygame.mouse.get_pos()
+    game_button(screen, exit_rect, "EXIT", button_font, mouse)
+    draw_game_board(screen, board, selected, legal, piece_font, small, view_color, last_move)
+
+    side = pygame.Rect(682, 142, 268, 600)
+    pygame.draw.rect(screen, GAME_PANEL_DARK, side, border_radius=18)
+    pygame.draw.rect(screen, GAME_BORDER, side, width=2, border_radius=18)
+    heading = button_font.render("MATCH", True, GAME_TEXT)
+    screen.blit(heading, heading.get_rect(center=(side.centerx, side.y + 38)))
+    status_lines = [status] if len(status) <= 28 else [status[:28], status[28:]]
+    for index, line in enumerate(status_lines):
+        status_image = small.render(line, True, GAME_MUTED)
+        screen.blit(status_image, status_image.get_rect(center=(side.centerx, side.y + 78 + index * 20)))
+    pygame.draw.line(screen, GAME_BORDER, (side.x + 20, side.y + 122), (side.right - 20, side.y + 122), width=1)
+
+    previous_rect = pygame.Rect(708, 300, 216, 54)
+    next_rect = pygame.Rect(708, 369, 216, 54)
+    resign_rect = pygame.Rect(708, 640, 216, 58)
+    game_button(screen, previous_rect, "‹  PREVIOUS MOVE", small, mouse, disabled=shown_moves == 0)
+    game_button(screen, next_rect, "NEXT MOVE  ›", small, mouse, disabled=shown_moves == total_moves)
+    timeline = small.render(f"Move {shown_moves} / {total_moves}", True, GAME_TEXT)
+    screen.blit(timeline, timeline.get_rect(center=(side.centerx, 462)))
+    hint = small.render("Review mode is read-only", True, GAME_MUTED)
+    screen.blit(hint, hint.get_rect(center=(side.centerx, 492)))
+    game_button(screen, resign_rect, "RESIGN", button_font, mouse, disabled=resigned is not None, danger=True)
+
+    player_panel(
+        screen, pygame.Rect(46, 766, 600, 76), bottom_name, bottom_color,
+        material_points(board, bottom_color), button_font, small,
+    )
+    promotion_options = None
+    if promotion_choices:
+        promotion_options = draw_promotion_picker(screen, piece_font, button_font, small, promotion_choices[0].start and board.piece_at(promotion_choices[0].start)[0])
+    return exit_rect, previous_rect, next_rect, resign_rect, promotion_options
 
 
 def draw(screen, board, selected, legal, font, small, status, view_color):
@@ -215,50 +389,132 @@ def draw_ai_training(screen, fonts, episodes, input_active, note):
 
 
 def run_game(screen, clock, fonts, chosen_color, opponent_mode):
-    font, small = pygame.font.SysFont("segoeuisymbol", 67), pygame.font.SysFont("arial", 20, bold=True)
+    screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
+    game_fonts = (
+        pygame.font.SysFont("georgia", 26, bold=True),
+        pygame.font.SysFont("arial", 17, bold=True),
+        pygame.font.SysFont("georgia", 21, bold=True),
+        pygame.font.SysFont("segoeuisymbol", 63),
+    )
     board, selected, legal = Board(), None, []
-    tables = load_tables() if opponent_mode == "ai" else None
+    model = QTableStore() if opponent_mode == "ai" else None
     computer_color = opponent(chosen_color) if opponent_mode == "ai" else None
     next_computer_move_at = pygame.time.get_ticks() + 450
     random_source = __import__("random").Random()
+    shown_moves = 0
+    promotion_choices = None
+    resigned = None
+    # The person using this screen is always shown underneath the board; this
+    # remains true when they choose to play Black and the board is rotated.
+    names = (
+        {"top": ("Player 2", opponent(chosen_color)), "bottom": ("Player 1", chosen_color)}
+        if opponent_mode == "player"
+        else {"top": ("Computer", computer_color), "bottom": ("You", chosen_color)}
+    )
+
+    def leave(result):
+        if model:
+            model.close()
+        return result
+
     while True:
-        if board.outcome():
+        total_moves = len(board.history)
+        shown_moves = min(shown_moves, total_moves)
+        display_board = board if shown_moves == total_moves else replay_board(board.history, shown_moves)
+        last_move = board.history[shown_moves - 1] if shown_moves else None
+        if resigned:
+            winner = "Black" if resigned == WHITE else "White"
+            status = ("White" if resigned == WHITE else "Black") + " resigned — " + winner + " wins"
+        elif shown_moves != total_moves:
+            status = "Viewing an earlier position"
+        elif board.outcome():
             status = board.outcome()
         elif board.in_check(board.turn):
-            status = ("White" if board.turn == WHITE else "Black") + " is in check — escape, capture, or block"
+            status = ("White" if board.turn == WHITE else "Black") + " is in check"
         else:
             status = "White to move" if board.turn == WHITE else "Black to move"
-        player_name = "White" if chosen_color == WHITE else "Black"
-        status += "   |   Your color: " + player_name
-        if opponent_mode == "ai":
-            computer_name = "Black" if chosen_color == WHITE else "White"
-            status += "   |   Computer: " + computer_name
+
+        exit_rect, previous_rect, next_rect, resign_rect, promotion_options = draw_game_screen(
+            screen, display_board, selected if shown_moves == total_moves else None,
+            legal if shown_moves == total_moves else [], game_fonts, chosen_color, last_move,
+            status, names, shown_moves, total_moves, resigned, promotion_choices,
+        )
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: return "quit"
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return "menu"
+            if event.type == pygame.QUIT: return leave("quit")
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return leave("menu")
             if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                board.reset(); selected, legal = None, []
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not board.outcome() and board.turn == chosen_color:
-                view_square = (event.pos[1] // SQUARE, event.pos[0] // SQUARE)
-                square = view_to_board(view_square, chosen_color)
-                choices = [m for m in legal if m.end == square]
-                if choices:
-                    # Promotion defaults to queen for a quick, playable UI.
-                    board.push(next((m for m in choices if m.promotion == "Q"), choices[0]))
+                board.reset(); selected, legal, shown_moves, promotion_choices, resigned = None, [], 0, None, None
+            if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+                continue
+            if exit_rect.collidepoint(event.pos):
+                return leave("menu")
+            if previous_rect.collidepoint(event.pos) and shown_moves:
+                shown_moves -= 1
+                selected, legal = None, []
+                continue
+            if next_rect.collidepoint(event.pos) and shown_moves < total_moves:
+                shown_moves += 1
+                selected, legal = None, []
+                continue
+            if resign_rect.collidepoint(event.pos) and not resigned:
+                resigned = board.turn
+                selected, legal, promotion_choices = None, [], None
+                continue
+            if promotion_choices:
+                for kind, rect in promotion_options.items():
+                    if rect.collidepoint(event.pos):
+                        board.push(next(move for move in promotion_choices if move.promotion == kind))
+                        shown_moves = len(board.history)
+                        selected, legal, promotion_choices = None, [], None
+                        break
+                continue
+
+            human_turn = opponent_mode == "player" or board.turn == chosen_color
+            if (
+                not GAME_BOARD_RECT.collidepoint(event.pos)
+                or resigned
+                or board.outcome()
+                or not human_turn
+            ):
+                continue
+            if shown_moves != total_moves:
+                # A click in the board while reviewing never alters the past.
+                shown_moves = total_moves
+                selected, legal = None, []
+                continue
+            view_square = (
+                (event.pos[1] - GAME_BOARD_TOP) // GAME_SQUARE,
+                (event.pos[0] - GAME_BOARD_LEFT) // GAME_SQUARE,
+            )
+            square = view_to_board(view_square, chosen_color)
+            choices = [move for move in legal if move.end == square]
+            if choices:
+                if choices[0].promotion:
+                    promotion_choices = choices
+                else:
+                    board.push(choices[0])
+                    shown_moves = len(board.history)
                     selected, legal = None, []
-                elif (piece := board.piece_at(square)) and piece[0] == board.turn:
-                    selected = square; legal = [m for m in board.legal_moves() if m.start == square]
-                else: selected, legal = None, []
+            elif (piece := board.piece_at(square)) and piece[0] == board.turn:
+                selected = square
+                legal = [move for move in board.legal_moves() if move.start == square]
+            else:
+                selected, legal = None, []
         if (
             opponent_mode == "ai"
+            and not resigned
+            and not promotion_choices
             and not board.outcome()
             and board.turn == computer_color
             and pygame.time.get_ticks() >= next_computer_move_at
         ):
-            board.push(best_move(board, computer_color, tables, random_source))
+            board.push(best_move(board, computer_color, model, random_source))
+            # If a human was inspecting an older position, an incoming move
+            # returns the board to the live position as requested.
+            shown_moves = len(board.history)
             selected, legal = None, []
             next_computer_move_at = pygame.time.get_ticks() + 450
-        draw(screen, board, selected, legal, font, small, status + "   [R] restart", chosen_color)
+        pygame.display.flip()
         clock.tick(60)
 
 
@@ -350,6 +606,7 @@ def main():
                         result = run_game(screen, clock, fonts, chosen_color, opponent_mode)
                         if result == "quit":
                             pygame.quit(); return
+                        screen = pygame.display.set_mode((WINDOW, WINDOW))
                         state = "menu"
             pygame.display.flip()
         elif state == "ai_training":
