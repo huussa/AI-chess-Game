@@ -3,7 +3,7 @@ import threading
 
 import pygame
 
-from chess_ai import QTableStore, best_move, train_both_colours
+from chess_ai import QTableStore, best_move, record_game_transition, state_id, train_both_colours
 from chess_engine import BLACK, WHITE, Board, Move, opponent
 
 WINDOW = 720
@@ -59,6 +59,11 @@ def material_points(board, color):
     )
 
 
+def material_difference(board, color):
+    """Show this side's material lead or deficit against its opponent."""
+    return material_points(board, color) - material_points(board, opponent(color))
+
+
 def game_button(screen, rect, label, font, mouse, *, disabled=False, danger=False):
     hovered = rect.collidepoint(mouse) and not disabled
     if disabled:
@@ -84,7 +89,7 @@ def player_panel(screen, rect, name, color, points, font, small):
     pygame.draw.circle(screen, accent, (avatar.centerx, avatar.y + 19), 8)
     pygame.draw.arc(screen, accent, (avatar.x + 10, avatar.y + 23, 28, 23), 180, 360, width=5)
     screen.blit(font.render(name, True, GAME_TEXT), (rect.x + 78, rect.y + 13))
-    score = small.render(f"{points} POINTS", True, GAME_MUTED)
+    score = small.render(f"{points:+d} POINTS", True, GAME_MUTED)
     screen.blit(score, (rect.x + 80, rect.y + 42))
 
 
@@ -165,7 +170,7 @@ def draw_game_screen(screen, board, selected, legal, fonts, view_color, last_mov
     bottom_name, bottom_color = names["bottom"]
     player_panel(
         screen, pygame.Rect(46, 42, 600, 76), top_name, top_color,
-        material_points(board, top_color), button_font, small,
+        material_difference(board, top_color), button_font, small,
     )
     exit_rect = pygame.Rect(795, 47, 155, 54)
     mouse = pygame.mouse.get_pos()
@@ -192,11 +197,15 @@ def draw_game_screen(screen, board, selected, legal, fonts, view_color, last_mov
     screen.blit(timeline, timeline.get_rect(center=(side.centerx, 462)))
     hint = small.render("Review mode is read-only", True, GAME_MUTED)
     screen.blit(hint, hint.get_rect(center=(side.centerx, 492)))
-    game_button(screen, resign_rect, "RESIGN", button_font, mouse, disabled=resigned is not None, danger=True)
+    game_button(
+        screen, resign_rect, "RESIGN", button_font, mouse,
+        disabled=resigned is not None or board.outcome() is not None,
+        danger=True,
+    )
 
     player_panel(
         screen, pygame.Rect(46, 766, 600, 76), bottom_name, bottom_color,
-        material_points(board, bottom_color), button_font, small,
+        material_difference(board, bottom_color), button_font, small,
     )
     promotion_options = None
     if promotion_choices:
@@ -403,6 +412,7 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
     random_source = __import__("random").Random()
     shown_moves = 0
     promotion_choices = None
+    pending_learning = None
     resigned = None
     # The person using this screen is always shown underneath the board; this
     # remains true when they choose to play Black and the board is rotated.
@@ -416,6 +426,22 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
         if model:
             model.close()
         return result
+
+    def captured_piece(move):
+        if move.en_passant:
+            return board.piece_at((move.start[0], move.end[1]))
+        return board.piece_at(move.end)
+
+    def learn_from_player_reply(opponent_capture=None, result=None):
+        nonlocal pending_learning
+        if not pending_learning:
+            return
+        state, computer_move, computer_capture = pending_learning
+        record_game_transition(
+            model, computer_color, state, computer_move, computer_capture, board,
+            captured_by_opponent=opponent_capture, result=result,
+        )
+        pending_learning = None
 
     while True:
         total_moves = len(board.history)
@@ -443,7 +469,7 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
             if event.type == pygame.QUIT: return leave("quit")
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return leave("menu")
             if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                board.reset(); selected, legal, shown_moves, promotion_choices, resigned = None, [], 0, None, None
+                board.reset(); selected, legal, shown_moves, promotion_choices, pending_learning, resigned = None, [], 0, None, None, None
             if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
                 continue
             if exit_rect.collidepoint(event.pos):
@@ -456,14 +482,20 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
                 shown_moves += 1
                 selected, legal = None, []
                 continue
-            if resign_rect.collidepoint(event.pos) and not resigned:
+            if resign_rect.collidepoint(event.pos) and not resigned and not board.outcome():
                 resigned = board.turn
+                winner = opponent(resigned)
+                winner_name = "White" if winner == WHITE else "Black"
+                learn_from_player_reply(result=f"checkmate: {winner_name} wins")
                 selected, legal, promotion_choices = None, [], None
                 continue
             if promotion_choices:
                 for kind, rect in promotion_options.items():
                     if rect.collidepoint(event.pos):
-                        board.push(next(move for move in promotion_choices if move.promotion == kind))
+                        move = next(move for move in promotion_choices if move.promotion == kind)
+                        opponent_capture = captured_piece(move)
+                        board.push(move)
+                        learn_from_player_reply(opponent_capture)
                         shown_moves = len(board.history)
                         selected, legal, promotion_choices = None, [], None
                         break
@@ -492,7 +524,9 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
                 if choices[0].promotion:
                     promotion_choices = choices
                 else:
+                    opponent_capture = captured_piece(choices[0])
                     board.push(choices[0])
+                    learn_from_player_reply(opponent_capture)
                     shown_moves = len(board.history)
                     selected, legal = None, []
             elif (piece := board.piece_at(square)) and piece[0] == board.turn:
@@ -508,7 +542,16 @@ def run_game(screen, clock, fonts, chosen_color, opponent_mode):
             and board.turn == computer_color
             and pygame.time.get_ticks() >= next_computer_move_at
         ):
-            board.push(best_move(board, computer_color, model, random_source))
+            computer_state = state_id(board)
+            computer_move = best_move(board, computer_color, model, random_source)
+            computer_capture = captured_piece(computer_move)
+            board.push(computer_move)
+            if board.outcome():
+                record_game_transition(
+                    model, computer_color, computer_state, computer_move, computer_capture, board
+                )
+            else:
+                pending_learning = (computer_state, computer_move, computer_capture)
             # If a human was inspecting an older position, an incoming move
             # returns the board to the live position as requested.
             shown_moves = len(board.history)
